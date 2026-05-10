@@ -20,8 +20,7 @@ from datetime import datetime, date
 #  الإعدادات
 # ─────────────────────────────────────────
 TELEGRAM_TOKEN = "8758650754:AAGmMh3KYV_2O7jndipDNTZfiNJw6JYW5Xw"
-OPENAI_KEY     = "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"
-RAPIDAPI_KEY   = "a23a17d86cmsh842318377a900e3p141dcajsn5c6bd1cd77ab"
+OPENAI_KEY     = "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"RAPIDAPI_KEY   = "a23a17d86cmsh842318377a900e3p141dcajsn5c6bd1cd77ab"
 BOOKING_AFF_ID = ""      # أضفه لاحقاً من partner.booking.com
 CURRENCY       = "SAR"
 
