@@ -3,7 +3,6 @@
 """
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ✈️  مساعد السفر الذكي — EnterNow MVP v3.0 (Bulletproof)
-    Telegram Webhooks + DeepSeek + Booking RapidAPI
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -17,11 +16,11 @@ from flask import Flask, request, jsonify
 # ─────────────────────────────────────────
 #  الإعدادات 
 # ─────────────────────────────────────────
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8758650754:AAGmMh3KYV_2O7jndipDNTZfiNJw6JYW5Xw")
-DEEPSEEK_KEY   = os.environ.get("DEEPSEEK_KEY", "sk-e60a2a3169954be082f4ed96190610e1")
-# تأكد من وضع مفتاحك الجديد هنا قبل الحفظ
-RAPIDAPI_KEY   = os.environ.get("RAPIDAPI_KEY", "93850ca6e4mshc965f580ee18a04p16301djsn87885afe8ab2'")
-BOOKING_AFF_ID = os.environ.get("BOOKING_AFF_ID", "") 
+TELEGRAM_TOKEN = "8758650754:AAGmMh3KYV_2O7jndipDNTZfiNJw6JYW5Xw"
+DEEPSEEK_KEY   = "sk-e60a2a3169954be082f4ed96190610e1"
+# 👇 ضع مفتاح رابيد آي بي آي الجديد هنا 👇
+RAPIDAPI_KEY   = "93850ca6e4mshc965f580ee18a04p16301djsn87885afe8ab2" 
+BOOKING_AFF_ID = "" 
 CURRENCY       = "SAR"
 
 # ─────────────────────────────────────────
@@ -135,8 +134,12 @@ def search_hotels(city: str, check_in: str, check_out: str, guests: int) -> list
         r.raise_for_status()
         raw = r.json().get("data", {}).get("hotels", []) or []
         log.info(f"[RapidAPI] Successfully found {len(raw)} raw hotel entries.")
+    except requests.exceptions.HTTPError as e:
+        body = e.response.text[:300] if e.response else "No body"
+        log.error(f"[RapidAPI Error] HTTP {e.response.status_code}: {body}")
+        return []
     except Exception as e:
-        log.error(f"[RapidAPI Search Error] {e}")
+        log.error(f"[RapidAPI Exception] {e}")
         return []
 
     try:
@@ -197,12 +200,14 @@ _SYS = f"""أنت مساعد سفر ذكي على تيليجرام مهمتك ج
   "check_in":  "YYYY-MM-DD أو null",
   "check_out": "YYYY-MM-DD أو null",
   "guests":    عدد_صحيح أو null,
+  "missing":   ["city"|"check_in"|"check_out"|"guests"],
   "selection": 1 | 2 | 3 | null,
   "reply":     "رد مختصر إذا كانت الرسالة لا علاقة لها بالحجز"
 }}
 • اليوم: {TODAY}
 • التواريخ يجب أن تكون YYYY-MM-DD بدقة تامة.
 • "شخصين" تعني 2.
+• missing يحتوي فقط الحقول الناقصة فعلياً. إذا ذكر كل شيء → missing: []
 """
 
 def gpt_parse(text: str, history: list, ctx: dict) -> dict:
@@ -220,7 +225,7 @@ def gpt_parse(text: str, history: list, ctx: dict) -> dict:
         r.raise_for_status()
         content = r.json()["choices"][0]["message"]["content"]
         result  = json.loads(content)
-        # الرادار: سحبنا كامل الإجابة لنفهم ماذا يفعل النموذج بالضبط
+        # هذا السطر هو "الرادار" الذي سيطبع لنا رد الذكاء الاصطناعي بالكامل لنكشف أي خطأ
         log.info(f"[DeepSeek Output] FULL JSON: {json.dumps(result, ensure_ascii=False)}")
         return result
     except Exception as e:
@@ -308,7 +313,7 @@ def handle_message(chat_id: int, uid: int, text: str, first_name: str):
         s["history"].append({"role": "assistant", "content": msg})
         return
 
-    # شبكة الأمان: نتحقق بأنفسنا مما ينقص، ولا نعتمد فقط على الذكاء الاصطناعي
+    # شبكة الأمان: نتحقق بأنفسنا مما ينقص
     if intent == "search" or any(ctx.get(f) for f in ("city", "check_in", "check_out", "guests")):
         actual_missing = [f for f in ("city", "check_in", "check_out", "guests") if not ctx.get(f)]
         
@@ -318,7 +323,6 @@ def handle_message(chat_id: int, uid: int, text: str, first_name: str):
             s["history"].append({"role": "assistant", "content": q})
             return
         else:
-            # كل المتطلبات مكتملة، ننطلق للبحث
             tmp = tg_send(chat_id, f"🔍 أدور لك على فنادق في *{ctx['city']}*...\n_قد يأخذ بضع ثوانٍ_ ⏳")
             tg_typing(chat_id)
             hotels = search_hotels(ctx["city"], ctx["check_in"], ctx["check_out"], ctx["guests"])
@@ -380,13 +384,6 @@ def webhook():
     except Exception as e:
         log.error(f"[Webhook Error] {e}")
     return "OK", 200
-
-@app.route('/set_webhook', methods=['GET'])
-def set_webhook():
-    host_url = request.host_url.rstrip('/')
-    webhook_url = f"{host_url}/webhook"
-    r = requests.post(f"{TG}/setWebhook", json={"url": webhook_url})
-    return jsonify({"status": "success" if r.status_code == 200 else "failed", "response": r.json()}), r.status_code
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
