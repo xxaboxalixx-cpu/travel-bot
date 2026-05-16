@@ -20,9 +20,6 @@ from flask import Flask, request, jsonify
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8758650754:AAGmMh3KYV_2O7jndipDNTZfiNJw6JYW5Xw")
 DEEPSEEK_KEY   = os.environ.get("DEEPSEEK_KEY", "sk-e60a2a3169954be082f4ed96190610e1")
 RAPIDAPI_KEY   = os.environ.get("RAPIDAPI_KEY", "curl --request GET \
-	--url 'https://booking-com15.p.rapidapi.com/api/v1/cars/searchCarRentals?pick_up_latitude=40.6397018432617&pick_up_longitude=-73.7791976928711&drop_off_latitude=40.6397018432617&drop_off_longitude=-73.7791976928711&pick_up_time=10%3A00&drop_off_time=10%3A00&driver_age=30&currency_code=USD&location=US' \
-	--header 'Content-Type: application/json' \
-	--header 'x-rapidapi-host: booking-com15.p.rapidapi.com' \
 	--header 'x-rapidapi-key: 93850ca6e4mshc965f580ee18a04p16301djsn87885afe8ab2'")
 BOOKING_AFF_ID = os.environ.get("BOOKING_AFF_ID", "") 
 CURRENCY       = "SAR"
