@@ -276,6 +276,8 @@ def handle_callback(chat_id: int, uid: int, msg_id: int, data: str):
 # ─────────────────────────────────────────
 #  Flask Webhooks
 # ─────────────────────────────────────────
+@app.route('/', methods=['GET'])
+def index(): return "🚀 EnterNow API is Live!", 200
 @app.route('/webhook', methods=['POST'])
 def webhook():
     upd = request.json
