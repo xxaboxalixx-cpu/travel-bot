@@ -2,29 +2,33 @@
 # -*- coding: utf-8 -*-
 """
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✈️  مساعد السفر الذكي — EnterNow MVP v4.0 (Business Logic)
+✈️  مساعد السفر الذكي — EnterNow MVP v3.0 (Bulletproof)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 import os
 import json
-import time
 import logging
 import requests
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from flask import Flask, request, jsonify
-from apscheduler.schedulers.background import BackgroundScheduler
 
 # ─────────────────────────────────────────
-#  الإعدادات
+#  الإعدادات 
 # ─────────────────────────────────────────
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8758650754:AAGmMh3KYV_2O7jndipDNTZfiNJw6JYW5Xw")
-DEEPSEEK_KEY   = os.environ.get("DEEPSEEK_KEY", "sk-e60a2a3169954be082f4ed96190610e1")
-RAPIDAPI_KEY   = os.environ.get("RAPIDAPI_KEY", "93850ca6e4mshc965f580ee18a04p16301djsn87885afe8ab2") 
-BOOKING_AFF_ID = os.environ.get("BOOKING_AFF_ID", "") 
+TELEGRAM_TOKEN = "8758650754:AAGmMh3KYV_2O7jndipDNTZfiNJw6JYW5Xw"
+DEEPSEEK_KEY   = "sk-e60a2a3169954be082f4ed96190610e1"
+# 👇 ضع مفتاح رابيد آي بي آي الجديد هنا 👇
+RAPIDAPI_KEY   = "93850ca6e4mshc965f580ee18a04p16301djsn87885afe8ab2" 
+BOOKING_AFF_ID = "" 
 CURRENCY       = "SAR"
 
-logging.basicConfig(format="%(asctime)s │ %(levelname)-7s │ %(message)s", level=logging.INFO)
+# ─────────────────────────────────────────
+logging.basicConfig(
+    format="%(asctime)s │ %(levelname)-7s │ %(message)s",
+    level=logging.INFO,
+    datefmt="%H:%M:%S",
+)
 log = logging.getLogger("EnterNow")
 
 TG = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
@@ -32,12 +36,8 @@ TODAY = date.today().strftime("%Y-%m-%d")
 
 app = Flask(__name__)
 
-# تهيئة مجدول المهام للمتابعة (Follow-ups)
-scheduler = BackgroundScheduler()
-scheduler.start()
-
 # ─────────────────────────────────────────
-#  الجلسات وقاعدة بيانات "رحلاتي" المصغرة
+#  الجلسات
 # ─────────────────────────────────────────
 _sessions: dict = {}
 
@@ -47,16 +47,12 @@ def get_session(uid: int) -> dict:
             "history": [],
             "ctx": {"city": None, "check_in": None, "check_out": None, "guests": None},
             "results": [],
-            "my_trips": [], # لحفظ الحجوزات
             "step": "idle",
         }
     return _sessions[uid]
 
 def clear_session(uid: int):
-    # نمسح سياق البحث فقط، ونحتفظ بـ "رحلاتي"
-    s = get_session(uid)
-    s["ctx"] = {"city": None, "check_in": None, "check_out": None, "guests": None}
-    s["history"] = []
+    _sessions.pop(uid, None)
 
 # ─────────────────────────────────────────
 #  Telegram
@@ -66,7 +62,7 @@ def _tg(method: str, payload: dict) -> dict:
         r = requests.post(f"{TG}/{method}", json=payload, timeout=10)
         return r.json()
     except Exception as e:
-        log.error(f"[TG] {e}")
+        log.error(f"[TG/{method}] {e}")
         return {}
 
 def tg_send(chat_id: int, text: str, keyboard: dict = None, preview: bool = False):
@@ -77,7 +73,7 @@ def tg_send(chat_id: int, text: str, keyboard: dict = None, preview: bool = Fals
 def tg_edit(chat_id: int, msg_id: int, text: str, keyboard: dict = None, preview: bool = False):
     p = {"chat_id": chat_id, "message_id": msg_id, "text": text[:4096], "parse_mode": "Markdown", "disable_web_page_preview": not preview}
     if keyboard: p["reply_markup"] = json.dumps(keyboard)
-    return _tg("editMessageText", p)
+    _tg("editMessageText", p)
 
 def tg_delete(chat_id: int, msg_id: int):
     _tg("deleteMessage", {"chat_id": chat_id, "message_id": msg_id})
@@ -85,30 +81,11 @@ def tg_delete(chat_id: int, msg_id: int):
 def tg_typing(chat_id: int):
     _tg("sendChatAction", {"chat_id": chat_id, "action": "typing"})
 
-# ─────────────────────────────────────────
-#  المهام المجدولة (Retargeting Logic)
-# ─────────────────────────────────────────
-def follow_up_24h(chat_id: int, hotel_name: str):
-    log.info(f"[Retargeting] 24h follow up for {chat_id}")
-    msg = f"أهلاً بك! 👋\nبخصوص اختيارك لفندق *{hotel_name}* بالأمس، هل أتممت الحجز؟"
-    kb = {"inline_keyboard": [
-        [{"text": "نعم، حجزت ✅", "callback_data": "track_yes"}, 
-         {"text": "لا، غيرت رأيي ❌", "callback_data": "track_no"}]
-    ]}
-    tg_send(chat_id, msg, keyboard=kb)
-
-def follow_up_7d(chat_id: int, hotel_name: str, original_price: float):
-    log.info(f"[Retargeting] 7d follow up for {chat_id}")
-    new_price = original_price - 50 # تخفيض وهمي لأغراض الـ MVP
-    msg = (f"عندي لك خبر سعيد! 🎉\n\n"
-           f"لقيت لك سعر أقل بـ *50 ر.س* لنفس الفندق اللي عجبك (*{hotel_name}*).\n"
-           f"السعر الجديد صار: *{new_price} ر.س*\n\n"
-           f"الفرصة ما تتعوض، تبي تحجز الآن؟ 👇")
-    kb = {"inline_keyboard": [[{"text": "ورني الرابط أحجز! 🔗", "callback_data": "resend_link"}]]}
-    tg_send(chat_id, msg, keyboard=kb)
+def tg_answer_cb(cb_id: str, text: str = ""):
+    _tg("answerCallbackQuery", {"callback_query_id": cb_id, "text": text})
 
 # ─────────────────────────────────────────
-#  RapidAPI و DeepSeek (نفس المنطق السابق)
+#  Booking.com
 # ─────────────────────────────────────────
 _BHOST = "booking-com15.p.rapidapi.com"
 _BBASE = f"https://{_BHOST}/api/v1/hotels"
@@ -123,44 +100,82 @@ def _booking_dest_id(city: str) -> str | None:
         for it in items:
             if it.get("search_type") in ("city", "region"): return it.get("dest_id")
         return items[0].get("dest_id")
-    except Exception as e: return None
+    except Exception as e:
+        log.error(f"[RapidAPI DestID Error] {e}")
+    return None
 
 def _extract_price(h: dict) -> float:
     pb = h.get("priceBreakdown") or {}
     gp = pb.get("grossPrice") or {}
-    v  = gp.get("value") or gp.get("amount_rounded") or gp.get("amount") or h.get("min_total_price")
+    v  = gp.get("value") or gp.get("amount_rounded") or gp.get("amount")
+    if v: return float(v)
+    v = h.get("min_total_price")
+    if v: return float(v)
+    prop = h.get("property") or {}
+    v = prop.get("priceBreakdown", {}).get("grossPrice", {}).get("value")
     return float(v) if v else 0.0
 
 def search_hotels(city: str, check_in: str, check_out: str, guests: int) -> list[dict]:
+    log.info(f"[Action] Searching dest_id for {city}...")
     dest_id = _booking_dest_id(city)
-    if not dest_id: return []
-    params = {"dest_id": dest_id, "search_type": "CITY", "arrival_date": check_in, "departure_date": check_out, "adults": str(guests), "room_qty": "1", "page_number": "1", "languagecode": "ar", "currency_code": CURRENCY, "units": "metric", "sort_by": "popularity"}
+    if not dest_id: 
+        log.warning(f"[Hotels] Could not find dest_id for {city}")
+        return []
+
+    log.info(f"[Action] Requesting hotels for dest_id: {dest_id}...")
+    params = {
+        "dest_id": dest_id, "search_type": "CITY", "arrival_date": check_in,
+        "departure_date": check_out, "adults": str(guests), "room_qty": "1",
+        "page_number": "1", "languagecode": "ar", "currency_code": CURRENCY,
+        "units": "metric", "sort_by": "popularity",
+    }
     try:
         r = requests.get(f"{_BBASE}/searchHotels", headers=_BH, params=params, timeout=20)
         r.raise_for_status()
         raw = r.json().get("data", {}).get("hotels", []) or []
-    except Exception as e: return []
+        log.info(f"[RapidAPI] Successfully found {len(raw)} raw hotel entries.")
+    except requests.exceptions.HTTPError as e:
+        body = e.response.text[:300] if e.response else "No body"
+        log.error(f"[RapidAPI Error] HTTP {e.response.status_code}: {body}")
+        return []
+    except Exception as e:
+        log.error(f"[RapidAPI Exception] {e}")
+        return []
 
-    n_nights = max(1, (datetime.strptime(check_out, "%Y-%m-%d") - datetime.strptime(check_in, "%Y-%m-%d")).days)
+    try:
+        n_nights = max(1, (datetime.strptime(check_out, "%Y-%m-%d") - datetime.strptime(check_in, "%Y-%m-%d")).days)
+    except Exception as e:
+        log.error(f"[Date Parsing Error] {e}")
+        n_nights = 1
+
     parsed = []
     for h in raw:
         prop = h.get("property") or {}
         name = (prop.get("name") or h.get("hotel_name") or "").strip()
-        price = _extract_price(h)
-        if not name or price == 0: continue
-        price_per_night = round(price / n_nights) if (price > 2000 and n_nights > 1) else round(price)
+        if not name: continue
+        rating = float(prop.get("reviewScore") or prop.get("review_score") or 0)
+        stars  = int(prop.get("propertyClass") or prop.get("hotel_class") or 0)
+        price  = _extract_price(h)
+
+        if price > 0:
+            price_per_night = round(price / n_nights) if (price > 2000 and n_nights > 1) else round(price)
+        else: continue
+
+        hotel_id = str(prop.get("id") or h.get("hotel_id") or name[:30])
         parsed.append({
-            "id": str(prop.get("id") or h.get("hotel_id") or name[:10]), "name": name, 
-            "rating": round(float(prop.get("reviewScore") or 0), 1),
-            "stars": int(prop.get("propertyClass") or 0),
-            "price_night": price_per_night, "price_total": price_per_night * n_nights,
+            "id": hotel_id, "name": name, "rating": round(rating, 1),
+            "stars": stars, "price_night": price_per_night,
+            "price_total": price_per_night * n_nights,
+            "photo": (prop.get("photoUrls") or [None])[0] or "",
         })
 
-    by_price = sorted(parsed, key=lambda x: x["price_night"])
-    by_score = sorted(parsed, key=lambda x: x["rating"]*2.5 - x["price_night"]/500, reverse=True)
-    
+    if not parsed: return []
+    by_price  = sorted(parsed, key=lambda x: x["price_night"])
+    by_rating = sorted(parsed, key=lambda x: -x["rating"])
+    by_score  = sorted(parsed, key=lambda x: x["rating"]*2.5 + x["stars"]*1.5 - x["price_night"]/500, reverse=True)
+
     top3, seen = [], set()
-    for h in by_price + by_score:
+    for h in [by_price[0], by_rating[0]] + by_score:
         if h["id"] not in seen:
             top3.append(h)
             seen.add(h["id"])
@@ -170,126 +185,204 @@ def search_hotels(city: str, check_in: str, check_out: str, guests: int) -> list
 def make_booking_link(h: dict, ci: str, co: str, guests: int) -> str:
     name_q = requests.utils.quote(h["name"])
     base = f"https://www.booking.com/search.html?ss={name_q}&checkin={ci}&checkout={co}&group_adults={guests}&no_rooms=1&selected_currency={CURRENCY}"
-    return base + f"&aid={BOOKING_AFF_ID}" if BOOKING_AFF_ID else base
+    if BOOKING_AFF_ID: base += f"&aid={BOOKING_AFF_ID}"
+    return base
 
-_SYS = f"""أنت مساعد سفر ذكي. مهمتك: أعد JSON فقط:
-{{"intent": "search"|"select"|"reset"|"other", "city": "اسم بالإنجليزي أو null", "check_in": "YYYY-MM-DD أو null", "check_out": "YYYY-MM-DD أو null", "guests": عدد أو null, "selection": 1|2|3|null, "reply": "رد مختصر سعودي"}}
-• اليوم: {TODAY}"""
+# ─────────────────────────────────────────
+#  DeepSeek 
+# ─────────────────────────────────────────
+_SYS = f"""أنت مساعد سفر ذكي على تيليجرام مهمتك جمع بيانات الحجز.
+أسلوبك: اللهجة السعودية، مختصر جداً.
+مهمتك: أعد JSON فقط بهذا الشكل:
+{{
+  "intent":    "search" | "select" | "reset" | "help" | "other",
+  "city":      "اسم المدينة بالإنجليزي أو null",
+  "check_in":  "YYYY-MM-DD أو null",
+  "check_out": "YYYY-MM-DD أو null",
+  "guests":    عدد_صحيح أو null,
+  "missing":   ["city"|"check_in"|"check_out"|"guests"],
+  "selection": 1 | 2 | 3 | null,
+  "reply":     "رد مختصر إذا كانت الرسالة لا علاقة لها بالحجز"
+}}
+• اليوم: {TODAY}
+• التواريخ يجب أن تكون YYYY-MM-DD بدقة تامة.
+• "شخصين" تعني 2.
+• missing يحتوي فقط الحقول الناقصة فعلياً. إذا ذكر كل شيء → missing: []
+"""
 
 def gpt_parse(text: str, history: list, ctx: dict) -> dict:
-    msg = text + f"\n[سياق: {json.dumps({k:v for k,v in ctx.items() if v}, ensure_ascii=False)}]"
-    messages = [{"role": "system", "content": _SYS}] + history[-5:] + [{"role": "user", "content": msg}]
+    known = {k: v for k, v in ctx.items() if v is not None}
+    msg = text + (f"\n[السياق المعروف: {json.dumps(known, ensure_ascii=False)}]" if known else "")
+    messages = [{"role": "system", "content": _SYS}] + history[-8:] + [{"role": "user", "content": msg}]
+
     try:
-        r = requests.post("https://api.deepseek.com/chat/completions", headers={"Authorization": f"Bearer {DEEPSEEK_KEY}"}, json={"model": "deepseek-chat", "messages": messages, "response_format": {"type": "json_object"}}, timeout=15)
+        r = requests.post(
+            "https://api.deepseek.com/chat/completions",
+            headers={"Authorization": f"Bearer {DEEPSEEK_KEY}", "Content-Type": "application/json"},
+            json={"model": "deepseek-chat", "messages": messages, "temperature": 0.05, "max_tokens": 350, "response_format": {"type": "json_object"}},
+            timeout=20,
+        )
         r.raise_for_status()
-        return json.loads(r.json()["choices"][0]["message"]["content"])
-    except Exception: return {"intent": "other", "reply": "صار خطأ، حاول مرة ثانية 🙏"}
+        content = r.json()["choices"][0]["message"]["content"]
+        result  = json.loads(content)
+        # هذا السطر هو "الرادار" الذي سيطبع لنا رد الذكاء الاصطناعي بالكامل لنكشف أي خطأ
+        log.info(f"[DeepSeek Output] FULL JSON: {json.dumps(result, ensure_ascii=False)}")
+        return result
+    except Exception as e:
+        log.error(f"[DeepSeek Error] {e}")
+        return {"intent": "other", "reply": "صار خطأ بالذكاء الاصطناعي، حاول مرة ثانية 🙏"}
 
 # ─────────────────────────────────────────
-#  الرسائل والتفاعل
+#  تنسيق الرسائل
 # ─────────────────────────────────────────
+_LABELS = {0: ("1️⃣", "الأرخص"), 1: ("2️⃣", "الأفضل تقييماً"), 2: ("3️⃣", "الأميز")}
+
+def _nights(ci: str, co: str) -> int:
+    try: return max(1, (datetime.strptime(co, "%Y-%m-%d") - datetime.strptime(ci, "%Y-%m-%d")).days)
+    except: return 1
+
+def _stars(n: int) -> str:
+    n = max(0, min(n, 5))
+    return "★" * n + "☆" * (5 - n) if n > 0 else ""
+
+def hotel_card(h: dict, idx: int, ci: str, co: str, g: int) -> str:
+    emoji, label = _LABELS.get(idx, ("🔘", "خيار"))
+    n = _nights(ci, co)
+    return (f"{emoji} *{label}*\n🏨 {h['name']}\n⭐ {h['rating']}  {_stars(h['stars'])}\n"
+            f"💰 {h['price_night']:,} ر.س/ليلة  ·  المجموع: *{h['price_total']:,} ر.س* ({n} ليالٍ)")
+
 def results_message(hotels: list, city: str, ci: str, co: str, g: int) -> str:
-    cards = "\n\n".join(f"{idx+1}️⃣ *{h['name']}*\n⭐ {h['rating']} | 💰 {h['price_total']} ر.س إجمالي" for idx, h in enumerate(hotels))
-    return f"✅ لقيت 3 خيارات في {city}\n📅 {ci} → {co} | 👥 {g} أشخاص\n\n{cards}\n\nأي واحد يعجبك؟ 👇"
+    n = _nights(ci, co)
+    header = f"✅ وجدت *{len(hotels)} خيارات* في {city}\n📅 {ci}  →  {co}  ·  {n} ليالٍ\n👥 {g} أشخاص\n{'━'*26}\n\n"
+    cards = "\n\n".join(hotel_card(h, i, ci, co, g) for i, h in enumerate(hotels))
+    return header + cards + f"\n\n{'━'*26}\nأي واحد يعجبك؟ 👇"
 
+def booking_message(h: dict, ci: str, co: str, g: int, link: str) -> str:
+    return (f"ممتاز! 🎉\n\n🏨 *{h['name']}*\n⭐ {h['rating']}  {_stars(h['stars'])}\n"
+            f"💰 *{h['price_total']:,} ر.س* إجمالي\n\n🔗 [اضغط هنا لإكمال الحجز]({link})\n\n"
+            f"✅ السعر مضمون\n✅ الإلغاء حسب سياسة الفندق\n━━━━━━━━━━━━━━━━━━━━━━━━\nتحتاج بحث ثاني؟  /start")
+
+def pick_keyboard() -> dict:
+    return {"inline_keyboard": [
+        [{"text": "1️⃣  احجز الأرخص", "callback_data": "book_0"}],
+        [{"text": "2️⃣  احجز الأفضل تقييماً", "callback_data": "book_1"}],
+        [{"text": "3️⃣  احجز الأميز", "callback_data": "book_2"}],
+        [{"text": "🔄  بحث جديد", "callback_data": "reset"}],
+    ]}
+
+def _q_for(field: str) -> str:
+    return {"city": "وين تبي تروح؟ 🌍", "check_in": "من أي تاريخ تبغى تدخل؟ 📅 (مثال: 2026-05-20)", 
+            "check_out": "وإلى أي تاريخ؟ 📅", "guests": "كم شخص؟ 👥"}.get(field, "وين تبي تروح؟")
+
+# ─────────────────────────────────────────
+#  معالجة الأحداث
+# ─────────────────────────────────────────
 def handle_message(chat_id: int, uid: int, text: str, first_name: str):
     s = get_session(uid)
     text = text.strip()
 
     if text.startswith("/start"):
         clear_session(uid)
-        tg_send(chat_id, f"هلا {first_name}! 👋\nوين تبي تروح؟\n_(تقدر تكتب: ابغى فندق بدبي بكرة لشخصين)_")
+        tg_send(chat_id, f"هلا {first_name}! 👋\nأنا مساعد سفرك الذكي ✈️\n\nوين تبي تروح وامتى؟\n_مثال: أبغى فندق في دبي من 20 إلى 23 يونيو لشخصين_")
         return
-    
-    if text.startswith("/mytrips"):
-        if not s["my_trips"]:
-            tg_send(chat_id, "سجلك فارغ 🧳\nابدأ بحث جديد واضغط على حجز لتُحفظ هنا.")
-            return
-        trips_text = "🧳 *رحلاتك المحفوظة:*\n\n" + "\n".join(f"🏨 {t['hotel']} ({t['date']})" for t in s["my_trips"])
-        tg_send(chat_id, trips_text)
+    if text.startswith("/reset"):
+        clear_session(uid)
+        tg_send(chat_id, "تم المسح 🔄\nوين تبي تروح؟")
         return
 
     s["history"].append({"role": "user", "content": text})
     tg_typing(chat_id)
+
     p = gpt_parse(text, s["history"], s["ctx"])
-    
+    intent, sel = p.get("intent", "other"), p.get("selection")
+
     for f in ("city", "check_in", "check_out", "guests"):
-        if p.get(f): s["ctx"][f] = p.get(f)
-    
-    if p.get("intent") == "search" or any(s["ctx"].values()):
-        missing = [f for f in ("city", "check_in", "check_out", "guests") if not s["ctx"].get(f)]
-        if missing:
-            q = {"city": "وين تبي تروح؟ 🌍", "check_in": "متى الدخول؟ 📅", "check_out": "ومتى الخروج؟ 📅", "guests": "كم شخص؟ 👥"}.get(missing[0])
+        if p.get(f) is not None: s["ctx"][f] = p.get(f)
+    ctx = s["ctx"]
+
+    if intent == "reset":
+        clear_session(uid)
+        tg_send(chat_id, "تم المسح 🔄\nوين تبي تروح؟")
+        return
+
+    if (intent == "select" or sel is not None) and s["results"]:
+        idx = max(0, min(int(sel or 1) - 1, len(s["results"]) - 1))
+        h = s["results"][idx]
+        msg = booking_message(h, ctx.get("check_in"), ctx.get("check_out"), ctx.get("guests"), make_booking_link(h, ctx.get("check_in"), ctx.get("check_out"), ctx.get("guests")))
+        tg_send(chat_id, msg, preview=True)
+        s["history"].append({"role": "assistant", "content": msg})
+        return
+
+    # شبكة الأمان: نتحقق بأنفسنا مما ينقص
+    if intent == "search" or any(ctx.get(f) for f in ("city", "check_in", "check_out", "guests")):
+        actual_missing = [f for f in ("city", "check_in", "check_out", "guests") if not ctx.get(f)]
+        
+        if actual_missing:
+            q = _q_for(actual_missing[0])
             tg_send(chat_id, q)
             s["history"].append({"role": "assistant", "content": q})
             return
-        
-        # ── Loading Animation ──
-        tmp = tg_send(chat_id, "🔍 ثواني.. جاري البحث في قواعد البيانات 🌐")
-        tmp_id = tmp.get("result", {}).get("message_id")
-        time.sleep(1)
-        if tmp_id: tg_edit(chat_id, tmp_id, "⚙️ جاري فلترة أفضل الأسعار 💰...")
-        tg_typing(chat_id)
-        
-        hotels = search_hotels(s["ctx"]["city"], s["ctx"]["check_in"], s["ctx"]["check_out"], s["ctx"]["guests"])
-        if tmp_id: tg_delete(chat_id, tmp_id)
+        else:
+            tmp = tg_send(chat_id, f"🔍 أدور لك على فنادق في *{ctx['city']}*...\n_قد يأخذ بضع ثوانٍ_ ⏳")
+            tg_typing(chat_id)
+            hotels = search_hotels(ctx["city"], ctx["check_in"], ctx["check_out"], ctx["guests"])
+            if tmp.get("result"): tg_delete(chat_id, tmp["result"]["message_id"])
 
-        if not hotels:
-            tg_send(chat_id, "ما لقيت فنادق متاحة. جرب تواريخ أخرى.")
+            if not hotels:
+                err = "ما لقيت فنادق متاحة بهالمواصفات 😔\nجرّب تواريخ أو مدينة أخرى\n/reset — ابدأ بحثاً جديداً"
+                tg_send(chat_id, err)
+                s["history"].append({"role": "assistant", "content": err})
+                return
+
+            s["results"], s["step"] = hotels, "results"
+            msg = results_message(hotels, ctx["city"], ctx["check_in"], ctx["check_out"], ctx["guests"])
+            tg_send(chat_id, msg, keyboard=pick_keyboard())
+            s["history"].append({"role": "assistant", "content": msg})
             return
 
-        s["results"] = hotels
-        kb = {"inline_keyboard": [[{"text": f"{i+1}️⃣ احجز الخيار {i+1}", "callback_data": f"book_{i}"}] for i in range(len(hotels))]}
-        tg_send(chat_id, results_message(hotels, s["ctx"]["city"], s["ctx"]["check_in"], s["ctx"]["check_out"], s["ctx"]["guests"]), keyboard=kb)
-        return
-
-    reply = p.get("reply", "وين تبي تروح؟")
+    reply = p.get("reply") or "تفضل، أخبرني وين تبي تروح؟ 😊"
     tg_send(chat_id, reply)
     s["history"].append({"role": "assistant", "content": reply})
 
-def handle_callback(chat_id: int, uid: int, msg_id: int, data: str):
+def handle_callback(chat_id: int, uid: int, msg_id: int, data: str, cb_id: str):
+    tg_answer_cb(cb_id)
     s = get_session(uid)
-    
+    if data == "reset":
+        clear_session(uid)
+        tg_edit(chat_id, msg_id, "تم المسح 🔄\nابدأ بحثاً جديداً: /start")
+        return
     if data.startswith("book_"):
         idx = int(data.split("_")[1])
-        h = s["results"][idx]
-        link = make_booking_link(h, s["ctx"]["check_in"], s["ctx"]["check_out"], s["ctx"]["guests"])
-        
-        # 1. حفظ في رحلاتي
-        s["my_trips"].append({"hotel": h['name'], "date": TODAY})
-        
-        # 2. جدولة الاستهداف (24 ساعة و 7 أيام)
-        scheduler.add_job(follow_up_24h, 'date', run_date=datetime.now() + timedelta(days=1), args=[chat_id, h['name']])
-        scheduler.add_job(follow_up_7d, 'date', run_date=datetime.now() + timedelta(days=7), args=[chat_id, h['name'], h['price_total']])
-        
-        msg = f"تم حفظ الفندق في /mytrips 🧳\n\n🏨 *{h['name']}*\n💰 *{h['price_total']} ر.س*\n🔗 [اضغط هنا لإكمال الحجز]({link})"
+        if not s["results"]:
+            tg_edit(chat_id, msg_id, "انتهت صلاحية هذه النتائج ⏰\nابدأ بحثاً جديداً: /start")
+            return
+        h = s["results"][max(0, min(idx, len(s["results"]) - 1))]
+        msg = booking_message(h, s["ctx"].get("check_in"), s["ctx"].get("check_out"), s["ctx"].get("guests"), make_booking_link(h, s["ctx"].get("check_in"), s["ctx"].get("check_out"), s["ctx"].get("guests")))
         tg_edit(chat_id, msg_id, msg, preview=True)
-        clear_session(uid) # تصفير بعد نجاح الاستخراج
-
-    elif data == "track_yes":
-        tg_edit(chat_id, msg_id, "ممتاز! رحلة سعيدة ✈️ شاركنا تقييمك بعد العودة.")
-    elif data == "track_no":
-        tg_edit(chat_id, msg_id, "مو مشكلة، إذا غيرت رأيك أنا موجود دايم 🫡 اكتب /start لبحث جديد.")
-    elif data == "resend_link":
-        tg_edit(chat_id, msg_id, "رائع! اكتب /start وسأبحث لك عن السعر المحدث فوراً.")
 
 # ─────────────────────────────────────────
 #  Flask Webhooks
 # ─────────────────────────────────────────
 @app.route('/', methods=['GET'])
-def index(): return "🚀 EnterNow API is Live!", 200
+def index(): return "🚀 EnterNow Bot is running!", 200
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
     upd = request.json
+    if not upd: return "No payload", 400
     try:
         if "message" in upd:
             m = upd["message"]
-            if m.get("text"): handle_message(m["chat"]["id"], m["from"]["id"], m["text"], m["from"].get("first_name", ""))
+            text = m.get("text", "").strip()
+            if text:
+                u, c = m.get("from", {}), m.get("chat", {})
+                handle_message(c["id"], u["id"], text, u.get("first_name", ""))
         elif "callback_query" in upd:
             cq = upd["callback_query"]
-            _tg("answerCallbackQuery", {"callback_query_id": cq["id"]})
-            handle_callback(cq["message"]["chat"]["id"], cq["from"]["id"], cq["message"]["message_id"], cq["data"])
-    except Exception as e: log.error(f"[Webhook Error] {e}")
+            u, m, c = cq.get("from", {}), cq.get("message", {}), cq.get("message", {}).get("chat", {})
+            handle_callback(c.get("id"), u.get("id"), m.get("message_id"), cq.get("data", ""), cq.get("id"))
+    except Exception as e:
+        log.error(f"[Webhook Error] {e}")
     return "OK", 200
 
 if __name__ == "__main__":
