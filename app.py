@@ -238,7 +238,8 @@ async def reliable_queue_consumer(worker_id: str, shard_id: int):
         heartbeat_task = None
         task_id = None
         try:
-            raw_msg = await r.bpop(q_pending, timeout=2) 
+            # === التعديل الهام هنا (brpop بدلاً من bpop) ===
+            raw_msg = await r.brpop(q_pending, timeout=2) 
             if not raw_msg: continue
             
             msg = QueueMessage.model_validate_json(raw_msg[1])
@@ -323,7 +324,7 @@ async def queue_reaper():
             logger.error(f"Reaper Error: {e}")
 
 # ============================================================
-# EXTERNAL SERVICES LOGIC (Booking)
+# EXTERNAL SERVICES LOGIC (Booking & Leases)
 # ============================================================
 
 @asynccontextmanager
@@ -552,4 +553,4 @@ async def metrics():
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, workers=1 if settings.run_worker_tier else 4)
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, workers=1 if settings.run_worker_tier else 4)
