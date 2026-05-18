@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     # مفاتيح العمليات والربط الفعلي
     telegram_token: str = os.getenv("TELEGRAM_TOKEN", "8758650754:AAGmMh3KYV_2O7jndipDNTZfiNJw6JYW5Xw")
     deepseek_api_key: str = os.getenv("DEEPSEEK_API_KEY", "sk-e60a2a3169954be082f4ed96190610e1")
-    rapidapi_key: str = os.getenv("RAPIDAPI_KEY", "a23a17d86cmsh842318377a900e3p141dcajsn5c6bd1cd77ab")
+    rapidapi_key: str = os.getenv("RAPIDAPI_KEY", "306c7368b1msh8820d2aceb8457bp1ba20cjsn980c79328197")
     booking_aff_id: str = os.getenv("BOOKING_AFF_ID", "")
     webhook_secret: str = os.getenv("WEBHOOK_SECRET", "CHANGE_ME_SECURELY")
     redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
