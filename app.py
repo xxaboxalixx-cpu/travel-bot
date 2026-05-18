@@ -16,14 +16,12 @@ import contextvars
 import redis.asyncio as redis
 import httpx
 import uvicorn
-import chromadb
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
 from fastapi import FastAPI, Request, HTTPException, Header, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 from pydantic_settings import BaseSettings
-from sentence_transformers import SentenceTransformer
 from openai import AsyncOpenAI
 
 # ============================================================
@@ -31,6 +29,7 @@ from openai import AsyncOpenAI
 # ============================================================
 
 class Settings(BaseSettings):
+    # مفاتيح العمليات والربط الفعلي
     telegram_token: str = os.getenv("TELEGRAM_TOKEN", "8758650754:AAGmMh3KYV_2O7jndipDNTZfiNJw6JYW5Xw")
     deepseek_api_key: str = os.getenv("DEEPSEEK_API_KEY", "sk-e60a2a3169954be082f4ed96190610e1")
     rapidapi_key: str = os.getenv("RAPIDAPI_KEY", "93850ca6e4mshc965f580ee18a04p16301djsn87885afe8ab2")
@@ -38,17 +37,17 @@ class Settings(BaseSettings):
     webhook_secret: str = os.getenv("WEBHOOK_SECRET", "CHANGE_ME_SECURELY")
     redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     
-    # Topology
+    # Process Topology (فصل الطبقات)
     run_api_tier: bool = os.getenv("RUN_API_TIER", "True").lower() == "true"
     run_worker_tier: bool = os.getenv("RUN_WORKER_TIER", "True").lower() == "true"
     
-    # Advanced Queue & Load Limits
+    # حدود الطوابير والتحكم بالضغط
     queue_shards: int = 5 
     safe_queue_depth: int = 5000
     max_queue_depth: int = 10000
     worker_concurrency: int = 10
     workflow_timeout: float = 28.0
-    visibility_timeout: float = 30.0 # Time before reaper assumes worker crash
+    visibility_timeout: float = 30.0 # الوقت المتاح للـ Worker قبل افتراض انهياره
 
 settings = Settings()
 
@@ -324,7 +323,7 @@ async def queue_reaper():
             logger.error(f"Reaper Error: {e}")
 
 # ============================================================
-# EXTERNAL SERVICES LOGIC
+# EXTERNAL SERVICES LOGIC (Booking & Leases)
 # ============================================================
 
 @asynccontextmanager
@@ -362,8 +361,9 @@ async def search_hotels_logic(data: HotelSearchRequest) -> List[HotelDTO]:
     try:  
         dest_resp = await client.get("https://booking-com15.p.rapidapi.com/api/v1/hotels/searchDestination", headers=headers, params={"query": data.city})  
         dest_resp.raise_for_status()  
-        dest_id = dest_resp.json().get("data", [{}])[0].get("dest_id")
-        if not dest_id: raise NonRetryableError("City not found")  
+        dest_data = dest_resp.json().get("data", [])
+        if not dest_data: raise NonRetryableError("City not found")  
+        dest_id = dest_data[0].get("dest_id")
 
         hotels_resp = await client.get(
             "https://booking-com15.p.rapidapi.com/api/v1/hotels/searchHotels",  
@@ -407,13 +407,20 @@ async def process_workflow(payload: dict, task_id: str):
     retries_left = max(1, 3 - payload.get("retries", 0))
     telegram_client = app_state["http_clients"]["telegram"]
 
-    # --- 1. AI Intent Extraction ---
+    # --- 1. استخراج النوايا بواسطة الذكاء الاصطناعي ---
     try:
         if not await cb_ai.can_execute(): raise RetryableError("AI Circuit Open")
 
         async with distributed_concurrency_lease("ai_calls", max_concurrent=20):
-            prompt = """أنت مساعد سفر ذكي. استخرج معلومات الحجز ورجع JSON فقط يحتوي على:
-            intent (search أو unknown), city, check_in, check_out, guests, error"""
+            prompt = """أنت مساعد سفر ذكي ومحترف. استخرج معلومات الحجز ورجع JSON فقط يحتوي على الحقول التالية:
+            intent (يجب أن يكون 'search' إذا ذكر مدينة أو طلب فندق، و 'unknown' لغير ذلك), 
+            city (اسم المدينة بالإنجليزية دائماً مثل Al Ahsa أو Dubai), 
+            check_in (تاريخ اليوم بالصيغة YYYY-MM-DD), 
+            check_out (تاريخ الغد بالصيغة YYYY-MM-DD), 
+            guests (عدد الضيوف كعدد صحيح، الافتراضي 1), 
+            error (أي رسالة خطأ إذا كانت البيانات ناقصة تماماً)
+            
+            ملاحظة هامة: إذا أرسل المستخدم اسم مدينة فقط (مثل الأحساء)، اعتبر الـ intent هو 'search' واجعل التاريخ يبدأ من اليوم ولمدة ليلة واحدة تلقائياً."""
             
             resp = await app_state["ai_client"].chat.completions.create(
                 model="deepseek-chat",
@@ -428,13 +435,17 @@ async def process_workflow(payload: dict, task_id: str):
             if raw_intent.get("error"):
                 raise NonRetryableError(raw_intent["error"])
             if raw_intent.get("intent") != "search" or not raw_intent.get("city"):
-                raise NonRetryableError("مرحباً بك! يرجى تزويدي بالمدينة وتواريخ الرحلة للبحث.")
+                raise NonRetryableError("مرحباً بك! يرجى تزويدي بالمدينة وتواريخ الرحلة للبحث عن أفضل الفنادق المتاحة.")
                 
+            # تعبئة تلقائية للتواريخ إذا لم يتم توفيرها لضمان عدم الانهيار
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            tomorrow_str = (datetime.now().replace(day=datetime.now().day+1)).strftime("%Y-%m-%d") if datetime.now().day < 28 else "2026-06-01" # Safe fallbacks
+            
             req = HotelSearchRequest(
                 city=raw_intent["city"],
-                check_in=raw_intent["check_in"],
-                check_out=raw_intent["check_out"],
-                guests=raw_intent.get("guests", 2)
+                check_in=raw_intent.get("check_in") or today_str,
+                check_out=raw_intent.get("check_out") or tomorrow_str,
+                guests=raw_intent.get("guests") or 1
             )
 
     except NonRetryableError as e:
@@ -446,26 +457,48 @@ async def process_workflow(payload: dict, task_id: str):
         await cb_ai.record(success=False)
         raise RetryableError(f"AI Failure: {e}")
 
-    # --- 2. Booking API Search ---
+    # --- 2. جلب الفنادق الفعلية وبناء الأزرار التفاعلية الحقيقية ---
     try:
         await telegram_client.post(f"https://api.telegram.org/bot{settings.telegram_token}/sendMessage",
-            json={"chat_id": chat_id, "text": "🔍 جاري البحث في قواعد البيانات..."})
+            json={"chat_id": chat_id, "text": "🔍 جاري البحث في قواعد البيانات وجلب الأسعار الفورية..."})
             
         hotels = await search_hotels_logic(req)
         
         if not hotels:
-            res_text = "😕 لم أجد فنادق متاحة لتلك التواريخ."
+            res_text = "😕 لم أجد فنادق متاحة لتلك المدينة أو التواريخ حالياً."
+            await telegram_client.post(
+                f"https://api.telegram.org/bot{settings.telegram_token}/sendMessage",
+                json={"chat_id": chat_id, "text": res_text}
+            )
         else:
-            res_text = f"✨ أفضل {len(hotels[:3])} خيارات في {req.city}:\n\n"
+            res_text = f"✨ <b>إليك أفضل الخيارات المتاحة في {req.city}:</b>\n\n"
+            inline_keyboard = [] # مصفوفة الأزرار الشفافة
+            
             for i, h in enumerate(hotels[:3], 1):
+                # دمج الـ Affiliate ID للتسويق بالعمولة في الرابط
                 aff_url = f"{h.url}?aid={settings.booking_aff_id}" if settings.booking_aff_id else h.url
-                res_text += f"<b>{i}. {h.name}</b>\n💰 السعر: {h.price:,.2f} {h.currency}\n<a href='{aff_url}'>احجز الآن</a>\n\n"
+                
+                # بناء النص بصيغة HTML آمنة
+                res_text += f"<b>{i}. {h.name}</b>\n💰 السعر: {h.price:,.2f} {h.currency}\n⭐ تقييم الفندق: {h.rating}\n\n"
+                
+                # إضافة الأزرار أسفل الرسالة بشكل تفاعلي حقيقي
+                inline_keyboard.append([
+                    {"text": f"🏨 احجز الخيار رقم {i}", "url": aff_url}
+                ])
 
-        await telegram_client.post(
-            f"https://api.telegram.org/bot{settings.telegram_token}/sendMessage",
-            json={"chat_id": chat_id, "text": res_text, "parse_mode": "HTML"},
-            timeout=get_remaining_timeout()
-        )
+            # إرسال الرسالة النهائية مع لوحة الأزرار (Inline Keyboard)
+            await telegram_client.post(
+                f"https://api.telegram.org/bot{settings.telegram_token}/sendMessage",
+                json={
+                    "chat_id": chat_id, 
+                    "text": res_text, 
+                    "parse_mode": "HTML",
+                    "reply_markup": {
+                        "inline_keyboard": inline_keyboard
+                    }
+                },
+                timeout=get_remaining_timeout()
+            )
         
         if r: await r.set(idem_key, "1", ex=86400)
 
@@ -488,7 +521,7 @@ async def webhook(req: Request, x_telegram_bot_api_secret_token: str = Header(de
     try:
         payload = await req.json()
         
-        # دعم النصوص العادية ونقرات الأزرار (Callback Queries)
+        # دعم مزدوج للنصوص العادية ونقرات أزرار الكيبورد المدمجة (Callback Queries)
         if "message" in payload and "text" in payload["message"]:
             chat_id = payload["message"]["chat"]["id"]
             text = payload["message"]["text"]
@@ -500,9 +533,11 @@ async def webhook(req: Request, x_telegram_bot_api_secret_token: str = Header(de
         
         r = app_state["redis"]
         if r:
+            # شحن وتوزيع المهام بطريقة عادلة بناءً على الـ Chat ID
             shard_id = hash(str(chat_id)) % settings.queue_shards
             q_pending = f"queue:shard:{shard_id}:pending"
             
+            # حماية ذكية من هجمات الإغراق (Load Shedding)
             q_len = await r.llen(q_pending)
             if q_len > settings.safe_queue_depth:
                 drop_prob = min(0.95, (q_len - settings.safe_queue_depth) / (settings.max_queue_depth - settings.safe_queue_depth))
@@ -510,6 +545,7 @@ async def webhook(req: Request, x_telegram_bot_api_secret_token: str = Header(de
                     logger.warning(f"Load Shedding active. Dropped webhook for shard {shard_id} (Prob: {drop_prob:.2f})")
                     raise HTTPException(503, "Queue Saturated - Adaptive Drop")
 
+            # حزم المهمة ودفعها إلى طابور المعالجة الآمن
             task = QueueMessage(payload={"chat_id": chat_id, "text": text})
             await r.lpush(q_pending, task.model_dump_json())
 
@@ -524,4 +560,5 @@ async def metrics():
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 if __name__ == "__main__":
+    # تشغيل طبقة المعالجة والأي بي آي بكفاءة إنتاجية عالية
     uvicorn.run("main:app", host="0.0.0.0", port=8000, workers=1 if settings.run_worker_tier else 4)
