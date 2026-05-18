@@ -257,7 +257,7 @@ async def process_workflow(payload: dict, task_id: str):
 # API ENDPOINT
 # ============================================================
 
-@app.post("/webhook")
+@app.post("/webhook2")
 async def webhook(req: Request, x_telegram_bot_api_secret_token: str = Header(default="")):
     try:
         payload = await req.json()
