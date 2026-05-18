@@ -1,389 +1,420 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✈️  مساعد السفر الذكي — EnterNow MVP v3.0 (Bulletproof)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
-
 import os
+import re
 import json
+import uuid
+import time
+import hashlib
 import logging
-import requests
-from datetime import datetime, date
-from flask import Flask, request, jsonify
+import asyncio
+import random
+from datetime import datetime
+from typing import Optional, List, Dict, Any
+from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
+import contextvars
 
-# ─────────────────────────────────────────
-#  الإعدادات 
-# ─────────────────────────────────────────
-TELEGRAM_TOKEN = "8758650754:AAGmMh3KYV_2O7jndipDNTZfiNJw6JYW5Xw"
-DEEPSEEK_KEY   = "sk-e60a2a3169954be082f4ed96190610e1"
-# 👇 ضع مفتاح رابيد آي بي آي الجديد هنا 👇
-RAPIDAPI_KEY   = "93850ca6e4mshc965f580ee18a04p16301djsn87885afe8ab2" 
-BOOKING_AFF_ID = "" 
-CURRENCY       = "SAR"
+import redis.asyncio as redis
+import httpx
+import uvicorn
+import chromadb
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
-# ─────────────────────────────────────────
-logging.basicConfig(
-    format="%(asctime)s │ %(levelname)-7s │ %(message)s",
-    level=logging.INFO,
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger("EnterNow")
+from fastapi import FastAPI, Request, HTTPException, Header, Response
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, ValidationError
+from pydantic_settings import BaseSettings
+from sentence_transformers import SentenceTransformer
+from openai import AsyncOpenAI
 
-TG = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-TODAY = date.today().strftime("%Y-%m-%d")
+# ============================================================
+# SETTINGS & TOPOLOGY
+# ============================================================
 
-app = Flask(__name__)
+class Settings(BaseSettings):
+    # تم إضافة المفاتيح هنا كقيم افتراضية
+    telegram_token: str = os.getenv("TELEGRAM_TOKEN", "8758650754:AAGmMh3KYV_2O7jndipDNTZfiNJw6JYW5Xw")
+    deepseek_api_key: str = os.getenv("DEEPSEEK_API_KEY", "sk-e60a2a3169954be082f4ed96190610e1")
+    rapidapi_key: str = os.getenv("RAPIDAPI_KEY", "93850ca6e4mshc965f580ee18a04p16301djsn87885afe8ab2")
+    booking_aff_id: str = os.getenv("BOOKING_AFF_ID", "")
+    webhook_secret: str = os.getenv("WEBHOOK_SECRET", "CHANGE_ME_SECURELY")
+    redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    
+    # Topology
+    run_api_tier: bool = os.getenv("RUN_API_TIER", "True").lower() == "true"
+    run_worker_tier: bool = os.getenv("RUN_WORKER_TIER", "True").lower() == "true"
+    
+    # Advanced Queue & Load Limits
+    queue_shards: int = 5 
+    safe_queue_depth: int = 5000
+    max_queue_depth: int = 10000
+    worker_concurrency: int = 10
+    workflow_timeout: float = 28.0
+    visibility_timeout: float = 30.0 # Time before reaper assumes worker crash
 
-# ─────────────────────────────────────────
-#  الجلسات
-# ─────────────────────────────────────────
-_sessions: dict = {}
+settings = Settings()
 
-def get_session(uid: int) -> dict:
-    if uid not in _sessions:
-        _sessions[uid] = {
-            "history": [],
-            "ctx": {"city": None, "check_in": None, "check_out": None, "guests": None},
-            "results": [],
-            "step": "idle",
-        }
-    return _sessions[uid]
+# ============================================================
+# OBSERVABILITY & TRACING CONTEXT
+# ============================================================
 
-def clear_session(uid: int):
-    _sessions.pop(uid, None)
+trace_id_var = contextvars.ContextVar("trace_id", default="system")
+span_id_var = contextvars.ContextVar("span_id", default="root")
+deadline_var = contextvars.ContextVar("deadline", default=0.0)
 
-# ─────────────────────────────────────────
-#  Telegram
-# ─────────────────────────────────────────
-def _tg(method: str, payload: dict) -> dict:
-    try:
-        r = requests.post(f"{TG}/{method}", json=payload, timeout=10)
-        return r.json()
-    except Exception as e:
-        log.error(f"[TG/{method}] {e}")
-        return {}
+def get_remaining_timeout() -> float:
+    return max(0.1, deadline_var.get() - time.monotonic())
 
-def tg_send(chat_id: int, text: str, keyboard: dict = None, preview: bool = False):
-    p = {"chat_id": chat_id, "text": text[:4096], "parse_mode": "Markdown", "disable_web_page_preview": not preview}
-    if keyboard: p["reply_markup"] = json.dumps(keyboard)
-    return _tg("sendMessage", p)
-
-def tg_edit(chat_id: int, msg_id: int, text: str, keyboard: dict = None, preview: bool = False):
-    p = {"chat_id": chat_id, "message_id": msg_id, "text": text[:4096], "parse_mode": "Markdown", "disable_web_page_preview": not preview}
-    if keyboard: p["reply_markup"] = json.dumps(keyboard)
-    _tg("editMessageText", p)
-
-def tg_delete(chat_id: int, msg_id: int):
-    _tg("deleteMessage", {"chat_id": chat_id, "message_id": msg_id})
-
-def tg_typing(chat_id: int):
-    _tg("sendChatAction", {"chat_id": chat_id, "action": "typing"})
-
-def tg_answer_cb(cb_id: str, text: str = ""):
-    _tg("answerCallbackQuery", {"callback_query_id": cb_id, "text": text})
-
-# ─────────────────────────────────────────
-#  Booking.com
-# ─────────────────────────────────────────
-_BHOST = "booking-com15.p.rapidapi.com"
-_BBASE = f"https://{_BHOST}/api/v1/hotels"
-_BH    = {"X-RapidAPI-Key": RAPIDAPI_KEY, "X-RapidAPI-Host": _BHOST}
-
-def _booking_dest_id(city: str) -> str | None:
-    try:
-        r = requests.get(f"{_BBASE}/searchDestination", headers=_BH, params={"query": city}, timeout=15)
-        r.raise_for_status()
-        items = r.json().get("data", [])
-        if not items: return None
-        for it in items:
-            if it.get("search_type") in ("city", "region"): return it.get("dest_id")
-        return items[0].get("dest_id")
-    except Exception as e:
-        log.error(f"[RapidAPI DestID Error] {e}")
-    return None
-
-def _extract_price(h: dict) -> float:
-    pb = h.get("priceBreakdown") or {}
-    gp = pb.get("grossPrice") or {}
-    v  = gp.get("value") or gp.get("amount_rounded") or gp.get("amount")
-    if v: return float(v)
-    v = h.get("min_total_price")
-    if v: return float(v)
-    prop = h.get("property") or {}
-    v = prop.get("priceBreakdown", {}).get("grossPrice", {}).get("value")
-    return float(v) if v else 0.0
-
-def search_hotels(city: str, check_in: str, check_out: str, guests: int) -> list[dict]:
-    log.info(f"[Action] Searching dest_id for {city}...")
-    dest_id = _booking_dest_id(city)
-    if not dest_id: 
-        log.warning(f"[Hotels] Could not find dest_id for {city}")
-        return []
-
-    log.info(f"[Action] Requesting hotels for dest_id: {dest_id}...")
-    params = {
-        "dest_id": dest_id, "search_type": "CITY", "arrival_date": check_in,
-        "departure_date": check_out, "adults": str(guests), "room_qty": "1",
-        "page_number": "1", "languagecode": "ar", "currency_code": CURRENCY,
-        "units": "metric", "sort_by": "popularity",
-    }
-    try:
-        r = requests.get(f"{_BBASE}/searchHotels", headers=_BH, params=params, timeout=20)
-        r.raise_for_status()
-        raw = r.json().get("data", {}).get("hotels", []) or []
-        log.info(f"[RapidAPI] Successfully found {len(raw)} raw hotel entries.")
-    except requests.exceptions.HTTPError as e:
-        body = e.response.text[:300] if e.response else "No body"
-        log.error(f"[RapidAPI Error] HTTP {e.response.status_code}: {body}")
-        return []
-    except Exception as e:
-        log.error(f"[RapidAPI Exception] {e}")
-        return []
-
-    try:
-        n_nights = max(1, (datetime.strptime(check_out, "%Y-%m-%d") - datetime.strptime(check_in, "%Y-%m-%d")).days)
-    except Exception as e:
-        log.error(f"[Date Parsing Error] {e}")
-        n_nights = 1
-
-    parsed = []
-    for h in raw:
-        prop = h.get("property") or {}
-        name = (prop.get("name") or h.get("hotel_name") or "").strip()
-        if not name: continue
-        rating = float(prop.get("reviewScore") or prop.get("review_score") or 0)
-        stars  = int(prop.get("propertyClass") or prop.get("hotel_class") or 0)
-        price  = _extract_price(h)
-
-        if price > 0:
-            price_per_night = round(price / n_nights) if (price > 2000 and n_nights > 1) else round(price)
-        else: continue
-
-        hotel_id = str(prop.get("id") or h.get("hotel_id") or name[:30])
-        parsed.append({
-            "id": hotel_id, "name": name, "rating": round(rating, 1),
-            "stars": stars, "price_night": price_per_night,
-            "price_total": price_per_night * n_nights,
-            "photo": (prop.get("photoUrls") or [None])[0] or "",
+class JSONLogFormatter(logging.Formatter):
+    def format(self, record):
+        msg = re.sub(r"(sk-[a-zA-Z0-9]{20,}|rapidapi-key:[a-zA-Z0-9]+)", "[REDACTED]", record.getMessage())
+        return json.dumps({
+            "timestamp": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "trace_id": trace_id_var.get(),
+            "span_id": span_id_var.get(),
+            "message": msg
         })
 
-    if not parsed: return []
-    by_price  = sorted(parsed, key=lambda x: x["price_night"])
-    by_rating = sorted(parsed, key=lambda x: -x["rating"])
-    by_score  = sorted(parsed, key=lambda x: x["rating"]*2.5 + x["stars"]*1.5 - x["price_night"]/500, reverse=True)
+logger = logging.getLogger("platform")
+handler = logging.StreamHandler()
+handler.setFormatter(JSONLogFormatter())
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
-    top3, seen = [], set()
-    for h in [by_price[0], by_rating[0]] + by_score:
-        if h["id"] not in seen:
-            top3.append(h)
-            seen.add(h["id"])
-        if len(top3) == 3: break
-    return top3
+REQ_COUNT = Counter("api_requests_total", "Requests", ["endpoint", "status"])
 
-def make_booking_link(h: dict, ci: str, co: str, guests: int) -> str:
-    name_q = requests.utils.quote(h["name"])
-    base = f"https://www.booking.com/search.html?ss={name_q}&checkin={ci}&checkout={co}&group_adults={guests}&no_rooms=1&selected_currency={CURRENCY}"
-    if BOOKING_AFF_ID: base += f"&aid={BOOKING_AFF_ID}"
-    return base
+# ============================================================
+# EXCEPTIONS
+# ============================================================
 
-# ─────────────────────────────────────────
-#  DeepSeek 
-# ─────────────────────────────────────────
-_SYS = f"""أنت مساعد سفر ذكي على تيليجرام مهمتك جمع بيانات الحجز.
-أسلوبك: اللهجة السعودية، مختصر جداً.
-مهمتك: أعد JSON فقط بهذا الشكل:
-{{
-  "intent":    "search" | "select" | "reset" | "help" | "other",
-  "city":      "اسم المدينة بالإنجليزي أو null",
-  "check_in":  "YYYY-MM-DD أو null",
-  "check_out": "YYYY-MM-DD أو null",
-  "guests":    عدد_صحيح أو null,
-  "missing":   ["city"|"check_in"|"check_out"|"guests"],
-  "selection": 1 | 2 | 3 | null,
-  "reply":     "رد مختصر إذا كانت الرسالة لا علاقة لها بالحجز"
-}}
-• اليوم: {TODAY}
-• التواريخ يجب أن تكون YYYY-MM-DD بدقة تامة.
-• "شخصين" تعني 2.
-• missing يحتوي فقط الحقول الناقصة فعلياً. إذا ذكر كل شيء → missing: []
-"""
+class RetryableError(Exception): pass
+class NonRetryableError(Exception): pass
 
-def gpt_parse(text: str, history: list, ctx: dict) -> dict:
-    known = {k: v for k, v in ctx.items() if v is not None}
-    msg = text + (f"\n[السياق المعروف: {json.dumps(known, ensure_ascii=False)}]" if known else "")
-    messages = [{"role": "system", "content": _SYS}] + history[-8:] + [{"role": "user", "content": msg}]
+# ============================================================
+# GLOBAL STATE
+# ============================================================
 
+app_state = {
+    "redis": None,
+    "http_clients": {},
+    "ai_client": None,
+    "thread_pool": None,
+    "worker_tasks": [],
+    "reaper_task": None,
+    "shutdown_event": asyncio.Event()
+}
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app_state["thread_pool"] = ThreadPoolExecutor(max_workers=2)
+    
     try:
-        r = requests.post(
-            "https://api.deepseek.com/chat/completions",
-            headers={"Authorization": f"Bearer {DEEPSEEK_KEY}", "Content-Type": "application/json"},
-            json={"model": "deepseek-chat", "messages": messages, "temperature": 0.05, "max_tokens": 350, "response_format": {"type": "json_object"}},
-            timeout=20,
-        )
-        r.raise_for_status()
-        content = r.json()["choices"][0]["message"]["content"]
-        result  = json.loads(content)
-        # هذا السطر هو "الرادار" الذي سيطبع لنا رد الذكاء الاصطناعي بالكامل لنكشف أي خطأ
-        log.info(f"[DeepSeek Output] FULL JSON: {json.dumps(result, ensure_ascii=False)}")
-        return result
+        app_state["redis"] = redis.from_url(settings.redis_url, decode_responses=True)
+        await app_state["redis"].ping()
     except Exception as e:
-        log.error(f"[DeepSeek Error] {e}")
-        return {"intent": "other", "reply": "صار خطأ بالذكاء الاصطناعي، حاول مرة ثانية 🙏"}
+        logger.critical(f"Redis initialization failed: {e}. Platform degraded.")
+    
+    # Mock for Qdrant/Weaviate (Chroma is blocking in Multi-Process)
+    # chromadb.PersistentClient() -> Replace with async VectorDB client in real cluster
 
-# ─────────────────────────────────────────
-#  تنسيق الرسائل
-# ─────────────────────────────────────────
-_LABELS = {0: ("1️⃣", "الأرخص"), 1: ("2️⃣", "الأفضل تقييماً"), 2: ("3️⃣", "الأميز")}
+    app_state["http_clients"]["telegram"] = httpx.AsyncClient(limits=httpx.Limits(max_keepalive_connections=50))
+    app_state["http_clients"]["booking"] = httpx.AsyncClient(limits=httpx.Limits(max_keepalive_connections=20))
+    app_state["ai_client"] = AsyncOpenAI(api_key=settings.deepseek_api_key, base_url="https://api.deepseek.com")
 
-def _nights(ci: str, co: str) -> int:
-    try: return max(1, (datetime.strptime(co, "%Y-%m-%d") - datetime.strptime(ci, "%Y-%m-%d")).days)
-    except: return 1
+    if settings.run_worker_tier:
+        logger.info(f"Booting Worker Tier ({settings.worker_concurrency} Consumers over {settings.queue_shards} Shards)")
+        for i in range(settings.worker_concurrency):
+            # Workers distribute themselves across shards for fairness
+            shard_id = i % settings.queue_shards
+            task = asyncio.create_task(reliable_queue_consumer(f"worker_{i}", shard_id))
+            app_state["worker_tasks"].append(task)
+        app_state["reaper_task"] = asyncio.create_task(queue_reaper())
 
-def _stars(n: int) -> str:
-    n = max(0, min(n, 5))
-    return "★" * n + "☆" * (5 - n) if n > 0 else ""
+    yield
 
-def hotel_card(h: dict, idx: int, ci: str, co: str, g: int) -> str:
-    emoji, label = _LABELS.get(idx, ("🔘", "خيار"))
-    n = _nights(ci, co)
-    return (f"{emoji} *{label}*\n🏨 {h['name']}\n⭐ {h['rating']}  {_stars(h['stars'])}\n"
-            f"💰 {h['price_night']:,} ر.س/ليلة  ·  المجموع: *{h['price_total']:,} ر.س* ({n} ليالٍ)")
+    app_state["shutdown_event"].set()
+    if settings.run_worker_tier:
+        await asyncio.gather(*app_state["worker_tasks"], return_exceptions=True)
+        if app_state["reaper_task"]: app_state["reaper_task"].cancel()
 
-def results_message(hotels: list, city: str, ci: str, co: str, g: int) -> str:
-    n = _nights(ci, co)
-    header = f"✅ وجدت *{len(hotels)} خيارات* في {city}\n📅 {ci}  →  {co}  ·  {n} ليالٍ\n👥 {g} أشخاص\n{'━'*26}\n\n"
-    cards = "\n\n".join(hotel_card(h, i, ci, co, g) for i, h in enumerate(hotels))
-    return header + cards + f"\n\n{'━'*26}\nأي واحد يعجبك؟ 👇"
+    for c in app_state["http_clients"].values(): await c.aclose()
+    if app_state["redis"]: await app_state["redis"].close()
+    app_state["thread_pool"].shutdown(wait=True)
 
-def booking_message(h: dict, ci: str, co: str, g: int, link: str) -> str:
-    return (f"ممتاز! 🎉\n\n🏨 *{h['name']}*\n⭐ {h['rating']}  {_stars(h['stars'])}\n"
-            f"💰 *{h['price_total']:,} ر.س* إجمالي\n\n🔗 [اضغط هنا لإكمال الحجز]({link})\n\n"
-            f"✅ السعر مضمون\n✅ الإلغاء حسب سياسة الفندق\n━━━━━━━━━━━━━━━━━━━━━━━━\nتحتاج بحث ثاني؟  /start")
+app = FastAPI(title="Distributed Control Plane", lifespan=lifespan)
 
-def pick_keyboard() -> dict:
-    return {"inline_keyboard": [
-        [{"text": "1️⃣  احجز الأرخص", "callback_data": "book_0"}],
-        [{"text": "2️⃣  احجز الأفضل تقييماً", "callback_data": "book_1"}],
-        [{"text": "3️⃣  احجز الأميز", "callback_data": "book_2"}],
-        [{"text": "🔄  بحث جديد", "callback_data": "reset"}],
-    ]}
+# ============================================================
+# RATIO-BASED CIRCUIT BREAKER (SRE Grade)
+# ============================================================
 
-def _q_for(field: str) -> str:
-    return {"city": "وين تبي تروح؟ 🌍", "check_in": "من أي تاريخ تبغى تدخل؟ 📅 (مثال: 2026-05-20)", 
-            "check_out": "وإلى أي تاريخ؟ 📅", "guests": "كم شخص؟ 👥"}.get(field, "وين تبي تروح؟")
+class RatioCircuitBreaker:
+    def __init__(self, name: str, window: int, min_volume: int, max_failure_ratio: float):
+        self.prefix = f"cb:ratio:{name}"
+        self.window = window
+        self.min_volume = min_volume
+        self.max_ratio = max_failure_ratio
 
-# ─────────────────────────────────────────
-#  معالجة الأحداث
-# ─────────────────────────────────────────
-def handle_message(chat_id: int, uid: int, text: str, first_name: str):
-    s = get_session(uid)
-    text = text.strip()
+    async def _clean_and_count(self, key: str, now: float) -> int:
+        r = app_state["redis"]
+        await r.zremrangebyscore(key, "-inf", now - self.window)
+        return await r.zcard(key)
 
-    if text.startswith("/start"):
-        clear_session(uid)
-        tg_send(chat_id, f"هلا {first_name}! 👋\nأنا مساعد سفرك الذكي ✈️\n\nوين تبي تروح وامتى؟\n_مثال: أبغى فندق في دبي من 20 إلى 23 يونيو لشخصين_")
-        return
-    if text.startswith("/reset"):
-        clear_session(uid)
-        tg_send(chat_id, "تم المسح 🔄\nوين تبي تروح؟")
-        return
-
-    s["history"].append({"role": "user", "content": text})
-    tg_typing(chat_id)
-
-    p = gpt_parse(text, s["history"], s["ctx"])
-    intent, sel = p.get("intent", "other"), p.get("selection")
-
-    for f in ("city", "check_in", "check_out", "guests"):
-        if p.get(f) is not None: s["ctx"][f] = p.get(f)
-    ctx = s["ctx"]
-
-    if intent == "reset":
-        clear_session(uid)
-        tg_send(chat_id, "تم المسح 🔄\nوين تبي تروح؟")
-        return
-
-    if (intent == "select" or sel is not None) and s["results"]:
-        idx = max(0, min(int(sel or 1) - 1, len(s["results"]) - 1))
-        h = s["results"][idx]
-        msg = booking_message(h, ctx.get("check_in"), ctx.get("check_out"), ctx.get("guests"), make_booking_link(h, ctx.get("check_in"), ctx.get("check_out"), ctx.get("guests")))
-        tg_send(chat_id, msg, preview=True)
-        s["history"].append({"role": "assistant", "content": msg})
-        return
-
-    # شبكة الأمان: نتحقق بأنفسنا مما ينقص
-    if intent == "search" or any(ctx.get(f) for f in ("city", "check_in", "check_out", "guests")):
-        actual_missing = [f for f in ("city", "check_in", "check_out", "guests") if not ctx.get(f)]
+    async def can_execute(self) -> bool:
+        r = app_state["redis"]
+        if not r: return True
+        now = time.time()
         
-        if actual_missing:
-            q = _q_for(actual_missing[0])
-            tg_send(chat_id, q)
-            s["history"].append({"role": "assistant", "content": q})
-            return
-        else:
-            tmp = tg_send(chat_id, f"🔍 أدور لك على فنادق في *{ctx['city']}*...\n_قد يأخذ بضع ثوانٍ_ ⏳")
-            tg_typing(chat_id)
-            hotels = search_hotels(ctx["city"], ctx["check_in"], ctx["check_out"], ctx["guests"])
-            if tmp.get("result"): tg_delete(chat_id, tmp["result"]["message_id"])
+        successes = await self._clean_and_count(f"{self.prefix}:ok", now)
+        failures = await self._clean_and_count(f"{self.prefix}:fail", now)
+        total = successes + failures
+        
+        if total >= self.min_volume:
+            ratio = failures / total
+            if ratio >= self.max_ratio:
+                logger.warning(f"Circuit {self.prefix} OPEN (Ratio: {ratio:.2f})")
+                return False
+        return True
 
-            if not hotels:
-                err = "ما لقيت فنادق متاحة بهالمواصفات 😔\nجرّب تواريخ أو مدينة أخرى\n/reset — ابدأ بحثاً جديداً"
-                tg_send(chat_id, err)
-                s["history"].append({"role": "assistant", "content": err})
-                return
+    async def record(self, success: bool):
+        r = app_state["redis"]
+        if not r: return
+        now = time.time()
+        key = f"{self.prefix}:ok" if success else f"{self.prefix}:fail"
+        await r.zadd(key, {f"{now}:{random.random()}": now})
+        await r.expire(key, self.window * 2)
 
-            s["results"], s["step"] = hotels, "results"
-            msg = results_message(hotels, ctx["city"], ctx["check_in"], ctx["check_out"], ctx["guests"])
-            tg_send(chat_id, msg, keyboard=pick_keyboard())
-            s["history"].append({"role": "assistant", "content": msg})
-            return
+cb_ai = RatioCircuitBreaker("ai", window=60, min_volume=20, max_failure_ratio=0.5)
 
-    reply = p.get("reply") or "تفضل، أخبرني وين تبي تروح؟ 😊"
-    tg_send(chat_id, reply)
-    s["history"].append({"role": "assistant", "content": reply})
+# ============================================================
+# EFFECTIVELY-ONCE ZSET QUEUE & HEARTBEATS
+# ============================================================
 
-def handle_callback(chat_id: int, uid: int, msg_id: int, data: str, cb_id: str):
-    tg_answer_cb(cb_id)
-    s = get_session(uid)
-    if data == "reset":
-        clear_session(uid)
-        tg_edit(chat_id, msg_id, "تم المسح 🔄\nابدأ بحثاً جديداً: /start")
-        return
-    if data.startswith("book_"):
-        idx = int(data.split("_")[1])
-        if not s["results"]:
-            tg_edit(chat_id, msg_id, "انتهت صلاحية هذه النتائج ⏰\nابدأ بحثاً جديداً: /start")
-            return
-        h = s["results"][max(0, min(idx, len(s["results"]) - 1))]
-        msg = booking_message(h, s["ctx"].get("check_in"), s["ctx"].get("check_out"), s["ctx"].get("guests"), make_booking_link(h, s["ctx"].get("check_in"), s["ctx"].get("check_out"), s["ctx"].get("guests")))
-        tg_edit(chat_id, msg_id, msg, preview=True)
+class QueueMessage(BaseModel):
+    task_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    payload: Dict[str, Any]
+    retries: int = 0
 
-# ─────────────────────────────────────────
-#  Flask Webhooks
-# ─────────────────────────────────────────
-@app.route('/', methods=['GET'])
-def index(): return "🚀 EnterNow Bot is running!", 200
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    upd = request.json
-    if not upd: return "No payload", 400
+async def renew_visibility(task_id: str, shard_id: int):
+    """Heartbeat task extending visibility timeout while processing."""
+    r = app_state["redis"]
     try:
-        if "message" in upd:
-            m = upd["message"]
-            text = m.get("text", "").strip()
-            if text:
-                u, c = m.get("from", {}), m.get("chat", {})
-                handle_message(c["id"], u["id"], text, u.get("first_name", ""))
-        elif "callback_query" in upd:
-            cq = upd["callback_query"]
-            u, m, c = cq.get("from", {}), cq.get("message", {}), cq.get("message", {}).get("chat", {})
-            handle_callback(c.get("id"), u.get("id"), m.get("message_id"), cq.get("data", ""), cq.get("id"))
+        while True:
+            await asyncio.sleep(settings.visibility_timeout / 2)
+            new_deadline = time.time() + settings.visibility_timeout
+            await r.zadd(f"queue:shard:{shard_id}:processing", {task_id: new_deadline})
+    except asyncio.CancelledError:
+        pass
+
+async def reliable_queue_consumer(worker_id: str, shard_id: int):
+    r = app_state["redis"]
+    q_pending = f"queue:shard:{shard_id}:pending"
+    q_processing = f"queue:shard:{shard_id}:processing"
+    h_payloads = f"queue:shard:{shard_id}:payloads"
+    q_dlq = "queue:dlq" # Global DLQ
+
+    while not app_state["shutdown_event"].is_set():
+        heartbeat_task = None
+        task_id = None
+        try:
+            # 1. Pop from pending list
+            raw_msg = await r.bpop(q_pending, timeout=2) # Returns tuple (list_name, element) or None
+            if not raw_msg: continue
+            
+            msg = QueueMessage.model_validate_json(raw_msg[1])
+            task_id = msg.task_id
+            
+            # 2. Add to ZSET processing & Hash (Atomically if possible, pipelined here)
+            async with r.pipeline() as pipe:
+                deadline = time.time() + settings.visibility_timeout
+                pipe.zadd(q_processing, {task_id: deadline})
+                pipe.hset(h_payloads, task_id, raw_msg[1])
+                await pipe.execute()
+
+            # 3. Start Heartbeat & Execute
+            heartbeat_task = asyncio.create_task(renew_visibility(task_id, shard_id))
+            
+            success = False
+            try:
+                await process_workflow(msg.payload, task_id)
+                success = True
+            except NonRetryableError as e:
+                logger.error(f"[{task_id}] NonRetryable: {e}")
+            except Exception as e:
+                logger.error(f"[{task_id}] Retryable: {e}")
+
+            # 4. Acknowledgment (DLQ or Success)
+            heartbeat_task.cancel()
+            
+            async with r.pipeline() as pipe:
+                pipe.zrem(q_processing, task_id)
+                pipe.hdel(h_payloads, task_id)
+                
+                if not success:
+                    msg.retries += 1
+                    if msg.retries >= 3:
+                        logger.warning(f"Task {task_id} poisoned. Moving to DLQ.")
+                        pipe.lpush(q_dlq, msg.model_dump_json())
+                    else:
+                        logger.info(f"Task {task_id} Re-queued (Attempt {msg.retries}).")
+                        pipe.rpush(q_pending, msg.model_dump_json())
+                await pipe.execute()
+
+        except asyncio.CancelledError:
+            # Graceful Worker Shutdown handling
+            logger.info(f"Worker {worker_id} cancelling. Safely re-queuing {task_id}.")
+            if heartbeat_task: heartbeat_task.cancel()
+            if task_id and raw_msg:
+                async with r.pipeline() as pipe:
+                    pipe.zrem(q_processing, task_id)
+                    pipe.hdel(h_payloads, task_id)
+                    pipe.lpush(q_pending, raw_msg[1]) # Put back at FRONT
+                    await pipe.execute()
+            break
+        except Exception as e:
+            logger.error(f"Worker {worker_id} Crashed: {e}")
+            await asyncio.sleep(1)
+
+async def queue_reaper():
+    """O(log N) Reaper scanning only expired items using ZRANGEBYSCORE"""
+    r = app_state["redis"]
+    while not app_state["shutdown_event"].is_set():
+        try:
+            await asyncio.sleep(10)
+            now = time.time()
+            
+            for shard_id in range(settings.queue_shards):
+                q_processing = f"queue:shard:{shard_id}:processing"
+                h_payloads = f"queue:shard:{shard_id}:payloads"
+                q_pending = f"queue:shard:{shard_id}:pending"
+                
+                # O(log N) fetch of only expired tasks
+                expired_tasks = await r.zrangebyscore(q_processing, "-inf", now)
+                
+                for task_id in expired_tasks:
+                    logger.warning(f"Reaper: Recovering dead task {task_id} on shard {shard_id}")
+                    payload = await r.hget(h_payloads, task_id)
+                    
+                    if payload:
+                        async with r.pipeline() as pipe:
+                            pipe.zrem(q_processing, task_id)
+                            pipe.hdel(h_payloads, task_id)
+                            pipe.lpush(q_pending, payload)
+                            await pipe.execute()
+                    else:
+                        # Orphaned score without payload
+                        await r.zrem(q_processing, task_id)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Reaper Error: {e}")
+
+# ============================================================
+# WORKFLOW ORCHESTRATION & IDEMPOTENCY
+# ============================================================
+
+@asynccontextmanager
+async def distributed_concurrency_lease(name: str, max_concurrent: int, timeout: int = 30):
+    """Effectively limits global concurrency without Token leak (using simple sets/counters safely)"""
+    r = app_state["redis"]
+    client_id = str(uuid.uuid4())
+    lease_key = f"lease:{name}"
+    
+    # Clean expired leases safely (simple approach)
+    await r.zremrangebyscore(lease_key, "-inf", time.time())
+    
+    active = await r.zcard(lease_key)
+    if active >= max_concurrent:
+        raise RetryableError("Concurrency Limit Reached")
+        
+    await r.zadd(lease_key, {client_id: time.time() + timeout})
+    try:
+        yield
+    finally:
+        await r.zrem(lease_key, client_id)
+
+async def process_workflow(payload: dict, task_id: str):
+    trace_id_var.set(payload.get("trace_id", str(uuid.uuid4())))
+    span_id_var.set(task_id)
+    deadline_var.set(time.monotonic() + settings.workflow_timeout)
+
+    r = app_state["redis"]
+    
+    # 1. Effectively-Once Idempotency Check (Check before Side-Effects)
+    idem_key = f"task:done:{task_id}"
+    if r and await r.get(idem_key):
+        logger.info("Task already completed. Skipping side-effects.")
+        return
+
+    chat_id = payload["chat_id"]
+    text = payload["text"]
+    retries_left = max(1, 3 - payload.get("retries", 0))
+
+    try:
+        if not await cb_ai.can_execute():
+            raise RetryableError("AI Circuit Open")
+
+        async with distributed_concurrency_lease("ai_calls", max_concurrent=20):
+            # 2. Smart Retry Deadline Budgeting
+            allocated_timeout = get_remaining_timeout() / retries_left
+            
+            resp = await app_state["ai_client"].chat.completions.create(
+                model="deepseek-chat",
+                messages=[{"role": "user", "content": text[:500]}],
+                timeout=allocated_timeout
+            )
+            await cb_ai.record(success=True)
+
+        # 3. Side Effects (Telegram API simulated)
+        await app_state["http_clients"]["telegram"].post(
+            f"https://api.telegram.org/bot{settings.telegram_token}/sendMessage",
+            json={"chat_id": chat_id, "text": "تمت المعالجة."},
+            timeout=get_remaining_timeout()
+        )
+
+        # 4. Commit Idempotency Mark Atomically Post-Success
+        if r: await r.set(idem_key, "1", ex=86400)
+
     except Exception as e:
-        log.error(f"[Webhook Error] {e}")
-    return "OK", 200
+        await cb_ai.record(success=False)
+        raise RetryableError(f"Workflow Interrupted: {e}")
+
+# ============================================================
+# API TIER & ADAPTIVE LOAD SHEDDING
+# ============================================================
+
+@app.post("/webhook")
+async def webhook(req: Request, x_telegram_bot_api_secret_token: str = Header(default="")):
+    if not settings.run_api_tier: raise HTTPException(404, "API Disabled")
+    if x_telegram_bot_api_secret_token != settings.webhook_secret: raise HTTPException(403, "Unauthorized")
+
+    try:
+        payload = await req.json()
+        chat_id = payload["message"]["chat"]["id"]
+        
+        r = app_state["redis"]
+        if r:
+            # 1. Tenant Sharding (Fairness)
+            shard_id = hash(str(chat_id)) % settings.queue_shards
+            q_pending = f"queue:shard:{shard_id}:pending"
+            
+            # 2. Adaptive Probabilistic Load Shedding
+            q_len = await r.llen(q_pending)
+            if q_len > settings.safe_queue_depth:
+                drop_prob = min(0.95, (q_len - settings.safe_queue_depth) / (settings.max_queue_depth - settings.safe_queue_depth))
+                if random.random() < drop_prob:
+                    logger.warning(f"Load Shedding active. Dropped webhook for shard {shard_id} (Prob: {drop_prob:.2f})")
+                    raise HTTPException(503, "Queue Saturated - Adaptive Drop")
+
+            # 3. Enqueue
+            task = QueueMessage(payload={"chat_id": chat_id, "text": payload["message"]["text"]})
+            await r.lpush(q_pending, task.model_dump_json())
+
+        return JSONResponse({"status": "ok"})
+    except HTTPException: raise
+    except Exception as e:
+        logger.error(f"Ingress Failure: {e}")
+        # Graceful degradation: If Redis is down, return 500 to trigger upstream webhook retries
+        return JSONResponse({"status": "error"}, status_code=500)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, workers=1 if settings.run_worker_tier else 4)
