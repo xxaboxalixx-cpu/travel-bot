@@ -483,8 +483,6 @@ async def process_workflow(payload: dict, task_id: str):
 @app.post("/webhook")
 async def webhook(req: Request, x_telegram_bot_api_secret_token: str = Header(default="")):
     if not settings.run_api_tier: raise HTTPException(404, "API Disabled")
-    if x_telegram_bot_api_secret_token != settings.webhook_secret: raise HTTPException(403, "Unauthorized")
-
     try:
         payload = await req.json()
         if "message" in payload and "text" in payload["message"]:
