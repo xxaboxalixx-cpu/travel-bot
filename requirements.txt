@@ -1,3 +1,29 @@
-requests
-flask
-gunicorn
+# ==========================================
+# Web Framework & ASGI Server
+# ==========================================
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+
+# ==========================================
+# Data Validation & Configuration
+# ==========================================
+pydantic>=2.4.0
+pydantic-settings>=2.0.0
+
+# ==========================================
+# Async External Services (HTTP & Queue)
+# ==========================================
+httpx>=0.25.0
+redis>=5.0.0
+
+# ==========================================
+# AI, LLMs & Vector Database
+# ==========================================
+openai>=1.0.0
+sentence-transformers>=2.2.2
+chromadb>=0.4.0
+
+# ==========================================
+# Observability & Metrics
+# ==========================================
+prometheus-client>=0.17.0
